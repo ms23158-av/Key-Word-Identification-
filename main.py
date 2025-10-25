@@ -2,7 +2,7 @@
 
 import requests
 from bs4 import BeautifulSoup
-import re
+import 
 import sqlite3
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
