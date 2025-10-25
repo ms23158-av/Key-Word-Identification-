@@ -1,185 +1,192 @@
 
-import time
-import sqlite3
+
 import requests
-from urllib.parse import urljoin, urlparse
-from urllib import robotparser
 from bs4 import BeautifulSoup
-from tqdm import tqdm
 import re
-from collections import Counter
-import csv
-import os
+import sqlite3
 from datetime import datetime
+from urllib.parse import urljoin, urlparse
+import pandas as pd
+from collections import Counter, defaultdict
+import matplotlib.pyplot as plt
+import seaborn as sns
+from wordcloud import WordCloud
+import networkx as nx
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
 
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    SKLEARN_AVAILABLE = True
-except Exception:
-    SKLEARN_AVAILABLE = False
+nltk.download('punkt')
+nltk.download('wordnet')
+nltk.download('stopwords')
 
-TARGETS = [
-    ("IIMA", "https://www.iima.ac.in/"),
-    ("IISER_MOHALI", "https://www.iisermohali.ac.in/"),
-    # Add more specific subpaths if you like, e.g.:
-    # ("IIMA_news", "https://www.iima.ac.in/news"),
-    # ("IISER_faculty", "https://www.iisermohali.ac.in/faculty"),
-]
-
-USER_AGENT = "KeywordScraper/1.0 (email: your-email@example.com)"
-REQUEST_DELAY_SECONDS = 1.0   
-TIMEOUT = 10  
-
-DB_PATH = "keyword_project_scrape.db"
-CSV_TOP_WORDS = "keyword_top_words.csv"
-
-STOPWORDS = {
-    'the','and','a','to','of','in','is','that','this','as','for','with','on','by','be','are',
-    'was','it','an','at','from','we','our','has','have','their','which','or','into','such','these',
-    'its','will','not','also','but','they','about','more','per','since','than','been','page','home',
-    'contact','read','download','menu','site'
+MAX_PAGES = 15          
+DB_PATH = "keyword_project_enhanced.db"
+SITES = {
+    "IIM_Ahmedabad": "https://www.iima.ac.in/",
+    "IISER_Mohali": "https://www.iisermohali.ac.in/"
 }
 
-
-def can_fetch(url, agent=USER_AGENT):
-    parsed = urlparse(url)
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    rp = robotparser.RobotFileParser()
-    rp.set_url(urljoin(base, "/robots.txt"))
-    try:
-        rp.read()
-    except Exception:
-        
-        return True
-    return rp.can_fetch(agent, url)
-
-def fetch_url(url):
-    headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, headers=headers, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.text
-
-def extract_text(html):
-    
-    soup = BeautifulSoup(html, "lxml")
-    for s in soup(["script", "style", "noscript", "header", "footer", "nav"]):
-        s.extract()
-   
-    main = soup.find("main")
-    if main:
-        text = main.get_text(separator=" ", strip=True)
-    else:
-        text = soup.get_text(separator=" ", strip=True)
-    
-    text = re.sub(r'\s+', ' ', text)
-    return text
-
-def init_db(path=DB_PATH):
-    conn = sqlite3.connect(path)
+def create_db(conn):
     cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS pages (
-                    id INTEGER PRIMARY KEY,
-                    site TEXT,
-                    url TEXT,
-                    status INTEGER,
-                    text_blob TEXT,
-                    title TEXT,
-                    scraped_at TEXT
-                )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site TEXT,
+            url TEXT,
+            status INTEGER,
+            text_blob TEXT,
+            title TEXT,
+            scraped_at TEXT
+        )
+    """)
     conn.commit()
-    return conn
 
 def store_page(conn, site, url, status, text_blob, title):
     cur = conn.cursor()
     scraped_at = datetime.utcnow().isoformat()
-    cur.execute("INSERT INTO pages (site,url,status,text_blob,title,scraped_at) VALUES (?,?,?,?,?,?)",
-            (site, url, status, text_blob, title, scraped_at))
-
+    cur.execute("""
+        INSERT INTO pages (site,url,status,text_blob,title,scraped_at)
+        VALUES (?,?,?,?,?,?)
+    """, (site, url, status, text_blob, title, scraped_at))
     conn.commit()
 
-TOKEN_RE = re.compile(r"[A-Za-z']+")
+def clean_text(text):
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^a-zA-Z ]', '', text)
+    return text.lower().strip()
 
-def tokenize(text):
-    tokens = TOKEN_RE.findall(text.lower())
-    tokens = [t for t in tokens if t not in STOPWORDS and len(t) > 1]
-    return tokens
+def extract_visible_text(html):
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(['script', 'style', 'noscript']):
+        tag.decompose()
+    return soup.get_text(separator=' '), soup.title.string if soup.title else ""
 
-def top_k_words(text, k=30):
-    tokens = tokenize(text)
-    c = Counter(tokens)
-    return c.most_common(k)
+def crawl_site(site_name, base_url, conn):
+    visited, to_visit = set(), [base_url]
+    count = 0
 
-
-def compute_tfidf_top_terms(docs, top_n=10):
-    if not SKLEARN_AVAILABLE:
-        print("sklearn not available: skipping TF-IDF")
-        return {}
-    vectorizer = TfidfVectorizer(stop_words='english', max_features=5000)
-    X = vectorizer.fit_transform(docs)
-    feature_names = vectorizer.get_feature_names_out()
-    results = {}
-    for i, row in enumerate(X):
-        rowdata = row.toarray().ravel()
-        top_idx = rowdata.argsort()[-top_n:][::-1]
-        top_terms = [(feature_names[idx], float(rowdata[idx])) for idx in top_idx if rowdata[idx] > 0]
-        results[i] = top_terms
-    return results
-
-def main():
-    conn = init_db()
-    saved_texts = []
-    saved_meta = []
-
-    for site_name, start_url in tqdm(TARGETS, desc="targets"):
-        if not can_fetch(start_url):
-            print(f"[WARN] robots.txt disallows fetching {start_url}. Skipping.")
+    while to_visit and count < MAX_PAGES:
+        url = to_visit.pop(0)
+        if url in visited:
             continue
 
         try:
-            html = fetch_url(start_url)
+            r = requests.get(url, timeout=10)
+            visited.add(url)
+            text, title = extract_visible_text(r.text)
+            clean = clean_text(text)
+            store_page(conn, site_name, url, r.status_code, clean, title)
+            count += 1
+            print(f"[{site_name}] Page {count} stored: {url}")
+
+            # collect internal links
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                full = urljoin(url, a["href"])
+                if base_url in full and full not in visited and len(to_visit) < 100:
+                    to_visit.append(full)
+
         except Exception as e:
-            print(f"[ERROR] fetching {start_url}: {e}")
-            store_page(conn, site_name, start_url, 0, "", "")
-            continue
+            print(f"Failed: {url} ({e})")
 
-        text = extract_text(html)
-       
-        soup = BeautifulSoup(html, "lxml")
-        title_tag = soup.find("title")
-        title = title_tag.get_text(strip=True) if title_tag else ""
+def preprocess_texts(texts):
+    stop_words = set(stopwords.words('english'))
+    lemmatizer = WordNetLemmatizer()
 
-        store_page(conn, site_name, start_url, 200, text, title)
-        saved_texts.append(text)
-        saved_meta.append((site_name, start_url, title))
-        time.sleep(REQUEST_DELAY_SECONDS)
+    cleaned_texts = []
+    for text in texts:
+        tokens = nltk.word_tokenize(text)
+        tokens = [lemmatizer.lemmatize(t) for t in tokens if t.isalpha() and t not in stop_words]
+        cleaned_texts.append(' '.join(tokens))
+    return cleaned_texts
 
-        
-    rows = []
-    for i, (site_name, url, title) in enumerate(saved_meta):
-        text = saved_texts[i]
-        top = top_k_words(text, k=50)
-        for w, cnt in top:
-            rows.append({'site': site_name, 'url': url, 'title': title, 'word': w, 'count': cnt})
-
+def analyze_keywords(conn):
+    df = pd.read_sql_query("SELECT site, text_blob FROM pages", conn)
+    df['clean_text'] = preprocess_texts(df['text_blob'])
     
-    with open(CSV_TOP_WORDS, "w", newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['site','url','title','word','count'])
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-    print(f"Saved top-word summary to {CSV_TOP_WORDS}")
-
     
-    if saved_texts and SKLEARN_AVAILABLE:
-        tfidf_res = compute_tfidf_top_terms(saved_texts, top_n=15)
-        
-        for i, meta in enumerate(saved_meta):
-            print("\n--- TF-IDF top terms for", meta[0], meta[1], "---")
-            for term, score in tfidf_res.get(i, []):
-                print(f"{term} ({score:.3f})")
+    all_counts = {}
+    for site, group in df.groupby('site'):
+        words = ' '.join(group['clean_text']).split()
+        counter = Counter(words)
+        all_counts[site] = counter.most_common(20)
 
+    return df, all_counts
+
+def plot_bar_charts(all_counts):
+    for site, words in all_counts.items():
+        data = pd.DataFrame(words, columns=['word', 'count'])
+        plt.figure(figsize=(8,5))
+        sns.barplot(data=data, x='count', y='word', palette='Blues_d')
+        plt.title(f"Top Words - {site}")
+        plt.tight_layout()
+        plt.savefig(f"{site}_bar_chart.png")
+        plt.show()
+
+def plot_word_cloud(df):
+    for site, group in df.groupby('site'):
+        text = ' '.join(group['clean_text'])
+        wc = WordCloud(width=800, height=400, background_color='white').generate(text)
+        plt.figure(figsize=(8,4))
+        plt.imshow(wc, interpolation='bilinear')
+        plt.axis("off")
+        plt.title(f"Word Cloud - {site}")
+        plt.savefig(f"{site}_wordcloud.png")
+        plt.show()
+
+def plot_tfidf_heatmap(df):
+    vectorizer = TfidfVectorizer(max_features=20)
+    tfidf = vectorizer.fit_transform(df['clean_text'])
+    feature_names = vectorizer.get_feature_names_out()
+    tfidf_df = pd.DataFrame(tfidf.toarray(), columns=feature_names)
+    tfidf_df['site'] = df['site']
+    avg_tfidf = tfidf_df.groupby('site').mean()
+
+    plt.figure(figsize=(10,6))
+    sns.heatmap(avg_tfidf, cmap="YlGnBu", annot=True)
+    plt.title("TF-IDF Heatmap (Top 20 Features)")
+    plt.tight_layout()
+    plt.savefig("tfidf_heatmap.png")
+    plt.show()
+
+def plot_cooccurrence_network(df):
+    for site, group in df.groupby('site'):
+        words = ' '.join(group['clean_text']).split()
+        pairs = defaultdict(int)
+        for i in range(len(words) - 1):
+            pairs[(words[i], words[i+1])] += 1
+
+        G = nx.Graph()
+        for (w1, w2), freq in pairs.items():
+            if freq > 2:
+                G.add_edge(w1, w2, weight=freq)
+
+        plt.figure(figsize=(8,6))
+        pos = nx.spring_layout(G, k=0.5)
+        nx.draw_networkx(G, pos, with_labels=True, node_size=50, font_size=8)
+        plt.title(f"Word Co-occurrence Network - {site}")
+        plt.tight_layout()
+        plt.savefig(f"{site}_network.png")
+        plt.show()
+
+def main():
+    conn = sqlite3.connect(DB_PATH)
+    create_db(conn)
+
+    # Crawl sites
+    for site_name, url in SITES.items():
+        crawl_site(site_name, url, conn)
+
+    # Analyze & visualize
+    df, all_counts = analyze_keywords(conn)
+    plot_bar_charts(all_counts)
+    plot_word_cloud(df)
+    plot_tfidf_heatmap(df)
+    plot_cooccurrence_network(df)
     conn.close()
-    print(f"SQLite DB saved at {DB_PATH}")
 
 if __name__ == "__main__":
     main()

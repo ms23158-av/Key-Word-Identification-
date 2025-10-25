@@ -1,0 +1,12 @@
+newspaper3k
+requests 
+beautifulsoup4 
+tqdm 
+scikit-learn 
+lxml
+seaborn
+nltk
+pandas
+matplotlib
+networkx
+wordcloud
