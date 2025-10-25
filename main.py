@@ -92,8 +92,9 @@ def init_db(path=DB_PATH):
 def store_page(conn, site, url, status, text_blob, title):
     cur = conn.cursor()
     scraped_at = datetime.utcnow().isoformat()
-    cur.execute("INSERT INTO pages (site,url,status,text_blob,title,scraped_at) VALUES (?,?,?,?,?)",
-                (site, url, status, text_blob, title, scraped_at))
+    cur.execute("INSERT INTO pages (site,url,status,text_blob,title,scraped_at) VALUES (?,?,?,?,?,?)",
+            (site, url, status, text_blob, title, scraped_at))
+
     conn.commit()
 
 TOKEN_RE = re.compile(r"[A-Za-z']+")
